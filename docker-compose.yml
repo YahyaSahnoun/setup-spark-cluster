@@ -1,0 +1,89 @@
+# =============================================================================
+# Spark standalone cluster for learning/practicing PySpark + Scala Spark.
+#
+#   spark-master  -> Spark Standalone Master   (UI: http://localhost:8080)
+#   spark-worker  -> One Spark Worker          (UI: http://localhost:8081)
+#   spark-client  -> Dev container: pyspark / spark-shell / spark-submit
+#
+# All three services are built from the SAME image (see Dockerfile) so
+# Java/Scala/Spark/PySpark versions can never drift between them.
+# =============================================================================
+
+x-spark-build: &spark-build
+  context: .
+  dockerfile: Dockerfile
+
+x-spark-common-volumes: &spark-common-volumes
+  - ./data:/opt/spark-data       # shared data dir, e.g. for reading/writing files
+  - ./python:/workspace/python   # PySpark scripts
+  - ./scala:/workspace/scala     # Scala Spark sources
+
+networks:
+  spark-network:
+    driver: bridge
+
+services:
+
+  spark-master:
+    build: *spark-build
+    image: spark-lab:3.5.3
+    container_name: spark-master
+    hostname: spark-master
+    command: >
+      /opt/spark/bin/spark-class org.apache.spark.deploy.master.Master
+      --host spark-master
+      --port 7077
+      --webui-port 8080
+    ports:
+      - "7077:7077"   # Spark master protocol port (used by workers / spark-submit)
+      - "8080:8080"   # Spark Master Web UI
+    networks:
+      - spark-network
+    volumes: *spark-common-volumes
+    mem_limit: 1g
+    cpus: 1
+    restart: unless-stopped
+
+  spark-worker:
+    image: spark-lab:3.5.3
+    container_name: spark-worker
+    hostname: spark-worker
+    depends_on:
+      - spark-master
+    command: >
+      /opt/spark/bin/spark-class org.apache.spark.deploy.worker.Worker
+      --webui-port 8081
+      --cores 2
+      --memory 2g
+      spark://spark-master:7077
+    ports:
+      - "8081:8081"   # Spark Worker Web UI
+    networks:
+      - spark-network
+    volumes: *spark-common-volumes
+    mem_limit: 2g
+    cpus: 2
+    restart: unless-stopped
+
+  spark-client:
+    image: spark-lab:3.5.3
+    container_name: spark-client
+    hostname: spark-client
+    depends_on:
+      - spark-master
+      - spark-worker
+    environment:
+      - SPARK_MASTER_URL=spark://spark-master:7077
+    # Keep the container alive so you can `docker compose exec` into it.
+    command: ["tail", "-f", "/dev/null"]
+    ports:
+      - "4040:4040"   # Spark Application UI (active job, when one is running)
+    networks:
+      - spark-network
+    volumes:
+      - .:/workspace  # entire project mounted -> add new scripts anytime, no rebuild
+    working_dir: /workspace
+    mem_limit: 2g
+    cpus: 2
+    stdin_open: true
+    tty: true
