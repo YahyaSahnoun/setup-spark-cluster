@@ -1,28 +1,102 @@
 # =============================================================================
-# Spark standalone cluster for learning/practicing PySpark + Scala Spark.
+# Spark standalone cluster + MySQL, for TP3 (Spark DataFrames <-> MySQL).
 #
+#   mysql         -> MySQL 8 with `classicmodels` + `ENSA_DB` auto-created
+#   kafka         -> Apache Kafka 3.8 (KRaft, no Zookeeper). In-network: kafka:9092
+#                    From the host: localhost:9094
 #   spark-master  -> Spark Standalone Master   (UI: http://localhost:8080)
 #   spark-worker  -> One Spark Worker          (UI: http://localhost:8081)
-#   spark-client  -> Dev container: pyspark / spark-shell / spark-submit
+#   spark-client  -> Dev container: sbt / spark-submit / spark-shell / Jupyter
 #
-# All three services are built from the SAME image (see Dockerfile) so
-# Java/Scala/Spark/PySpark versions can never drift between them.
+# Inside the Docker network, MySQL is reached at  mysql:3306  (NOT localhost).
 # =============================================================================
 
 x-spark-build: &spark-build
   context: .
   dockerfile: Dockerfile
 
-x-spark-common-volumes: &spark-common-volumes
-  - ./data:/opt/spark-data       # shared data dir, e.g. for reading/writing files
-  - ./python:/workspace/python   # PySpark scripts
-  - ./scala:/workspace/scala     # Scala Spark sources
+# Every Spark container must see the same data path, because executors on the
+# worker read files (e.g. empData.csv) themselves.
+x-spark-data-volume: &spark-data-volume
+  - ./data:/opt/spark-data
 
 networks:
   spark-network:
     driver: bridge
 
+volumes:
+  mysql-data:
+  kafka-data:
+  sbt-cache:
+  coursier-cache:
+
 services:
+
+  mysql:
+    image: mysql:8.0
+    container_name: mysql
+    hostname: mysql
+    command: --default-authentication-plugin=mysql_native_password
+    environment:
+      MYSQL_ROOT_PASSWORD: root
+    ports:
+      - "3307:3306"   # host:3307 -> container:3306 (avoids clashing with a local MySQL)
+    networks:
+      - spark-network
+    volumes:
+      - mysql-data:/var/lib/mysql
+      # *.sql / *.sh here run ONCE, on first start with an empty mysql-data volume
+      - ./mysql-init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      # 127.0.0.1 (TCP) so it only passes once init scripts are finished
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-uroot", "-proot"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 20s
+    mem_limit: 1g
+    restart: unless-stopped
+
+  kafka:
+    image: apache/kafka:3.8.0
+    container_name: kafka
+    hostname: kafka
+    environment:
+      # --- single node acting as both broker and controller (KRaft) ---
+      CLUSTER_ID: "MkU3OEVBNTcwNTJENDM2Qk"
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      # --- listeners ---
+      #   PLAINTEXT (9092): used by containers inside the Docker network
+      #   EXTERNAL  (9094): used from your host machine
+      KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093,EXTERNAL://:9094
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,EXTERNAL://localhost:9094
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,EXTERNAL:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      # --- single-broker settings ---
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_NUM_PARTITIONS: 3
+      KAFKA_LOG_DIRS: /var/lib/kafka/data
+      KAFKA_HEAP_OPTS: "-Xms512m -Xmx512m"
+    ports:
+      - "9094:9094"   # host access only; containers use kafka:9092
+    networks:
+      - spark-network
+    volumes:
+      - kafka-data:/var/lib/kafka/data
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 > /dev/null 2>&1"]
+      interval: 10s
+      timeout: 10s
+      retries: 20
+      start_period: 20s
+    mem_limit: 1g
+    restart: unless-stopped
 
   spark-master:
     build: *spark-build
@@ -35,11 +109,11 @@ services:
       --port 7077
       --webui-port 8080
     ports:
-      - "7077:7077"   # Spark master protocol port (used by workers / spark-submit)
-      - "8080:8080"   # Spark Master Web UI
+      - "7077:7077"
+      - "8080:8080"
     networks:
       - spark-network
-    volumes: *spark-common-volumes
+    volumes: *spark-data-volume
     mem_limit: 1g
     cpus: 1
     restart: unless-stopped
@@ -57,11 +131,11 @@ services:
       --memory 2g
       spark://spark-master:7077
     ports:
-      - "8081:8081"   # Spark Worker Web UI
+      - "8081:8081"
     networks:
       - spark-network
-    volumes: *spark-common-volumes
-    mem_limit: 2g
+    volumes: *spark-data-volume
+    mem_limit: 3g          # > worker --memory 2g, leaves room for JVM overhead
     cpus: 2
     restart: unless-stopped
 
@@ -70,20 +144,29 @@ services:
     container_name: spark-client
     hostname: spark-client
     depends_on:
-      - spark-master
-      - spark-worker
+      mysql:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      spark-master:
+        condition: service_started
+      spark-worker:
+        condition: service_started
     environment:
       - SPARK_MASTER_URL=spark://spark-master:7077
-    # Keep the container alive so you can `docker compose exec` into it.
     command: ["tail", "-f", "/dev/null"]
     ports:
-      - "4040:4040"   # Spark Application UI (active job, when one is running)
+      - "4040:4040"   # Spark Application UI
+      - "8888:8888"   # JupyterLab
     networks:
       - spark-network
     volumes:
-      - .:/workspace  # entire project mounted -> add new scripts anytime, no rebuild
+      - .:/workspace
+      - ./data:/opt/spark-data
+      - sbt-cache:/root/.sbt              # keeps sbt downloads between restarts
+      - coursier-cache:/root/.cache       # keeps dependency cache (Coursier)
     working_dir: /workspace
-    mem_limit: 2g
+    mem_limit: 3g          # sbt needs more headroom than plain spark-submit
     cpus: 2
     stdin_open: true
     tty: true

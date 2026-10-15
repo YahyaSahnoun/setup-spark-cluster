@@ -1,51 +1,55 @@
-# Spark Docker Environment
+# Spark + MySQL Docker Environment
 
 A self-contained Docker Compose lab for practicing Apache Spark with **both
 PySpark and Scala**, against a real (if tiny) Spark Standalone cluster
-running on your own machine.
+running on your own machine, plus a **MySQL 8** database for the
+DataFrame <-> MySQL exercises of **TP3** (`classicmodels`, `ENSA_DB`).
 
 ---
 
 ## 1. Overview
 
-This project gives you three containers:
+This project gives you four containers:
 
-| Service        | Role                                                        |
-|----------------|--------------------------------------------------------------|
-| `spark-master` | Spark Standalone Master                                      |
-| `spark-worker` | One Spark Worker, registered with the master                 |
-| `spark-client` | Dev container: `pyspark`, `spark-shell`, `spark-submit`, `scalac` |
+| Service        | Role                                                                    |
+|----------------|--------------------------------------------------------------------------|
+| `mysql`        | MySQL 8.0 with `classicmodels` and `ENSA_DB` created automatically       |
+| `spark-master` | Spark Standalone Master                                                  |
+| `spark-worker` | One Spark Worker, registered with the master                             |
+| `spark-client` | Dev container: `sbt`, `pyspark`, `spark-shell`, `spark-submit`, `scalac`, Jupyter |
 
-You do all your work from `spark-client`. `spark-master` and `spark-worker`
-just need to be up and running in the background.
+You do all your work from `spark-client`. `mysql`, `spark-master` and
+`spark-worker` just need to be up and running in the background.
 
 ---
 
 ## 2. Architecture
 
 ```text
-                         Host
-                          │
-                    Docker Compose
-                          │
-        ┌─────────────────┼─────────────────┐
-        │                 │                 │
-        ▼                 ▼                 ▼
-  spark-master       spark-worker      spark-client
-   (UI :8080)          (UI :8081)       (UI :4040)
-        │                 │                 │
-        │                 │          ┌──────┴──────┐
-        │                 │          │             │
-        │                 │       PySpark        Scala
-        │                 │          │             │
-        └─────────────────┴──────────┴─────────────┘
-                  spark://spark-master:7077
+                              Host
+                               │
+                         Docker Compose
+                               │
+     ┌──────────────┬──────────┼───────────────┐
+     ▼              ▼          ▼               ▼
+   mysql       spark-master  spark-worker  spark-client
+ (:3306 in      (UI :8080)    (UI :8081)    (UI :4040)
+  network,          │             │              │
+  :3307 host)       │             │       ┌──────┴──────┐
+     ▲              │             │    PySpark        Scala/sbt
+     │              └─────────────┴───────┬─────────────┘
+     │                       spark://spark-master:7077
+     └──────────── JDBC: jdbc:mysql://mysql:3306 ◄── driver + executors
 ```
 
-All three containers share **one Docker image** (built once from the single
-`Dockerfile` in this repo), so Java, Scala, Spark and PySpark are guaranteed
-to be identical everywhere. `spark-master` and `spark-worker` just run
-different Spark daemon processes from that same image.
+All Spark containers share **one Docker image** (built once from the single
+`Dockerfile`), so Java, Scala, Spark, PySpark and the MySQL JDBC driver are
+guaranteed to be identical everywhere.
+
+**Important:** inside the Docker network, MySQL is reachable at
+`mysql:3306`, **not** `localhost:3306`. `localhost` inside a container is the
+container itself. From your host machine (DBeaver, `mysql` CLI...), use
+`127.0.0.1:3307`.
 
 ---
 
@@ -54,8 +58,10 @@ different Spark daemon processes from that same image.
 - Pop!_OS 24.04 (or any recent Linux/macOS/Windows with Docker)
 - Docker Engine + Docker Compose v2 (`docker compose`, not the old
   `docker-compose`)
-- ~4 GB of free RAM for the containers (comfortable on a 16 GB machine)
-- Internet access the first time you build (to download Spark/Scala)
+- ~8 GB of free RAM for the containers (comfortable on a 16 GB machine):
+  worker 3 GB + client 3 GB + MySQL 1 GB + master 1 GB (upper limits)
+- Internet access the first time you build (Spark, Scala, sbt, JDBC driver)
+  and the first time sbt resolves dependencies
 
 ---
 
@@ -68,37 +74,50 @@ spark-docker/
 ├── Dockerfile
 ├── README.md
 │
+├── mysql-init/                      # run ONCE on first MySQL start, in filename order
+│   ├── 00-create-ensa-db.sql        # creates ENSA_DB (TP3 Part II)
+│   └── 01-classicmodels.sql         # YOU add this (TP3 Part I) - see section 7
+│
 ├── python/
 │   └── test_spark.py
 │
 ├── scala/
-│   └── TestSpark.scala
+│   ├── TestSpark.scala              # standalone scalac example (section 12)
+│   └── tp3/                         # sbt project for TP3
+│       ├── build.sbt
+│       ├── project/build.properties
+│       └── src/main/scala/          # your TP3 .scala files go here
 │
-└── data/
-    └── .gitkeep        # keeps the empty folder in version control
+├── notebooks/
+│   └── test_spark.ipynb
+│
+└── data/                            # mounted at /opt/spark-data in ALL Spark containers
+    ├── .gitkeep
+    └── empData.csv                  # YOU add this (TP3 Part II)
 ```
 
-`data/` is mounted into every container at `/opt/spark-data` — drop CSVs,
-Parquet files, etc. there and all three services can see them.
-
-The only file added beyond your spec is `data/.gitkeep`, purely so the empty
-`data/` folder survives a `git add`/`git commit` (Git does not track empty
-directories). It has no effect on Docker or Spark.
+`data/` is mounted into the master, worker and client at `/opt/spark-data`.
+The **worker needs it too**: executors read input files themselves, so a path
+that only exists on the client would fail with "file not found".
 
 ---
 
 ## 5. Version Compatibility
 
-| Component | Version         | Why it's compatible                                   |
-|-----------|-----------------|--------------------------------------------------------|
-| Java      | 17 (Temurin)    | Spark 3.3+ officially supports Java 17                |
-| Spark     | 3.5.3           | Latest stable 3.5.x release                           |
-| Scala     | 2.12.18         | Spark 3.5.x is built against Scala 2.12                |
-| Python    | 3.10 (Ubuntu 22.04 base) | Within PySpark 3.5.x's supported range (3.8–3.12) |
-| PySpark   | 3.5.3 (pip)     | Pinned to match the Spark cluster version exactly     |
+| Component         | Version                  | Why it's compatible                                   |
+|-------------------|--------------------------|--------------------------------------------------------|
+| Java              | 17 (Temurin)             | Spark 3.3+ officially supports Java 17                |
+| Spark             | 3.5.3                    | Stable 3.5.x release                                  |
+| Scala             | 2.12.18                  | Spark 3.5.x is built against Scala 2.12               |
+| sbt               | 1.10.2                   | `build.sbt` must use `scalaVersion := "2.12.18"`      |
+| Python            | 3.10 (Ubuntu 22.04 base) | Within PySpark 3.5.x's supported range (3.8-3.12)     |
+| PySpark           | 3.5.3 (pip)              | Pinned to match the Spark cluster version exactly     |
+| MySQL server      | 8.0                      | Official image, `mysql_native_password` enabled       |
+| MySQL JDBC driver | mysql-connector-j 8.0.33 | Baked into `$SPARK_HOME/jars` (driver class `com.mysql.cj.jdbc.Driver`) |
+| JupyterLab        | latest (pip)             | Only needs a compatible Python                        |
 
 Keeping PySpark's pip version identical to the cluster's Spark version is the
-single most important compatibility rule here — a mismatch is the #1 cause
+single most important compatibility rule here: a mismatch is the #1 cause
 of cryptic `spark-submit` errors.
 
 ---
@@ -111,29 +130,65 @@ docker compose build
 ```
 
 This builds the shared image (`spark-lab:3.5.3`) once. The first build takes
-a few minutes (downloading Spark + Scala); later builds are cached.
+a few minutes (downloading Spark, Scala, sbt and the JDBC driver); later
+builds are cached.
 
 ---
 
-## 7. Start the Environment
+## 7. Prepare the TP3 Data
+
+1. **classicmodels**: download the `classicmodels` SQL script (the
+   mysqltutorial.org one) and save it as:
+
+   ```text
+   mysql-init/01-classicmodels.sql
+   ```
+
+   The script already contains `CREATE DATABASE classicmodels` / `USE`, and
+   MySQL runs the files in `mysql-init/` alphabetically, so `ENSA_DB` is
+   created first and `classicmodels` second.
+
+2. **empData.csv**: put it in `data/`.
+
+> Init scripts only run on the **first** start with an **empty** MySQL
+> volume. If you add or change a script later, re-run them with:
+> `docker compose down -v && docker compose up -d` (this deletes all MySQL data).
+
+---
+
+## 8. Start the Environment
 
 ```bash
 docker compose up -d
-```
-
-Check everything is running:
-
-```bash
 docker compose ps
 ```
 
-You should see `spark-master`, `spark-worker` and `spark-client` all `Up`.
+You should see `mysql`, `spark-master`, `spark-worker` and `spark-client`
+all `Up`. `mysql` shows `healthy` once the import has finished;
+`spark-client` only starts after that, so the first start can take a minute.
 
 ---
 
-## 8. Check the Spark Cluster
+## 9. Check MySQL
 
-Tail the worker's logs and look for a registration message:
+```bash
+docker compose exec mysql mysql -uroot -proot \
+  -e "SHOW DATABASES; USE classicmodels; SHOW TABLES; SELECT COUNT(*) FROM customers;"
+```
+
+You should see `classicmodels` and `ENSA_DB` in the list, 8 `classicmodels`
+tables, and 122 customers.
+
+Credentials: user `root`, password `root`.
+
+| From where                  | Host        | Port   |
+|-----------------------------|-------------|--------|
+| Spark code (any container)  | `mysql`     | `3306` |
+| Your host (DBeaver, CLI...) | `127.0.0.1` | `3307` |
+
+---
+
+## 10. Check the Spark Cluster
 
 ```bash
 docker compose logs spark-worker | grep -i "registered"
@@ -145,31 +200,23 @@ You should see a line like:
 INFO Worker: Successfully registered with master spark://spark-master:7077
 ```
 
-You can also confirm it visually — see the next section.
+---
+
+## 11. Access the Spark Web UI
+
+| UI                   | URL                   | What it shows                                      |
+|----------------------|-----------------------|-----------------------------------------------------|
+| Spark Master UI      | http://localhost:8080 | Registered workers, running/completed applications  |
+| Spark Worker UI      | http://localhost:8081 | That worker's cores, memory, running executors      |
+| Spark Application UI | http://localhost:4040 | Jobs/stages/tasks for the app *currently* running   |
+
+Open http://localhost:8080 first: under "Workers" you should see one worker
+listed as `ALIVE`. The Application UI at port 4040 only exists **while a job
+is actively running**.
 
 ---
 
-## 9. Access the Spark Web UI
-
-With the ports as configured in `docker-compose.yml`:
-
-| UI                  | URL                            | What it shows                                   |
-|---------------------|---------------------------------|--------------------------------------------------|
-| Spark Master UI     | http://localhost:8080           | Registered workers, running/completed applications |
-| Spark Worker UI     | http://localhost:8081           | That worker's cores, memory, running executors    |
-| Spark Application UI| http://localhost:4040            | Jobs/stages/tasks for whatever app is *currently* running from `spark-client` |
-
-Open http://localhost:8080 first — under "Workers" you should see one worker
-listed as `ALIVE`. That's your confirmation the cluster is healthy.
-
-The Application UI at port 4040 only exists **while a job is actively
-running** (opened by the driver). Once the job finishes, it disappears.
-
----
-
-## 10. Test PySpark
-
-### 10.1 Interactive PySpark
+## 12. Test PySpark and Scala
 
 Enter the client container:
 
@@ -177,232 +224,253 @@ Enter the client container:
 docker compose exec spark-client bash
 ```
 
-Then launch the interactive shell, pointed at the real cluster:
+### 12.1 Interactive shells
 
 ```bash
-pyspark --master spark://spark-master:7077
+pyspark     --master spark://spark-master:7077
+spark-shell --master spark://spark-master:7077
 ```
 
-What happens: `pyspark` starts a Python REPL with a `SparkSession` already
-created for you as `spark`. Because you passed `--master`, the **driver**
-runs inside `spark-client`, but the actual Spark **executors** are launched
-by `spark-worker` and do the real computation. You'll see the application
-appear on the Master UI (http://localhost:8080) and get a live UI at
-http://localhost:4040 while the shell is open.
+The **driver** runs inside `spark-client`; the **executors** are launched by
+`spark-worker`. Try `spark.range(1000).count()`. Exit with `exit()` /
+`:quit`.
 
-Try it:
-
-```python
->>> spark.range(1000).count()
-```
-
-Type `exit()` or press `Ctrl-D` to leave.
-
-### 10.2 Run the PySpark Test
-
-Run it locally first (no cluster, quick sanity check):
+### 12.2 PySpark script
 
 ```bash
-python3 python/test_spark.py
+python3 python/test_spark.py                       # local sanity check
+spark-submit --master spark://spark-master:7077 /workspace/python/test_spark.py
 ```
 
-Then submit it to the real cluster:
+### 12.3 Scala with plain `scalac` (quick single-file tests)
 
 ```bash
-spark-submit \
-  --master spark://spark-master:7077 \
-  /workspace/python/test_spark.py
+cd /workspace/scala
+mkdir -p build/classes
+scalac -classpath "$SPARK_HOME/jars/*" -d build/classes TestSpark.scala
+cd build/classes && jar cf ../TestSpark.jar . && cd ../..
+
+spark-submit --class TestSpark --master spark://spark-master:7077 \
+  /workspace/scala/build/TestSpark.jar
 ```
 
-- `spark-submit` is Spark's standard tool for launching an application
-  (Python, Scala or Java) against a cluster.
-- `--master spark://spark-master:7077` tells Spark which cluster manager
-  and master to use — here, our own Standalone master.
-- The **driver** (the process running your `main`/script logic and
-  coordinating the job) runs on `spark-client`, the machine you invoked
-  `spark-submit` from.
-- The **executors** (the processes that actually run tasks on data
-  partitions) are launched by `spark-worker`, using the cores/memory you
-  gave it (`--cores 2 --memory 2g` in `docker-compose.yml`).
-
-### 10.3 Understanding the PySpark Test
-
-`python/test_spark.py`:
-
-1. Creates a `SparkSession`.
-2. Prints `spark.version`.
-3. Builds a 5-row DataFrame of `(name, age, city)`.
-4. Shows it with `.show()`.
-5. Applies `.filter(age > 25)`, then `.select(...)`, then `.groupBy("city").count()` — all lazy transformations.
-6. Calls `.count()` — an **action** — which is what actually triggers a Spark job (you'll see it appear on the Master/Application UI at that moment).
-7. Stops the `SparkSession` with `.stop()`.
+For anything bigger than one file (like TP3), use sbt (next section).
 
 ---
 
-## 11. Test Scala Spark
+## 13. TP3: Spark DataFrames with MySQL (Scala + sbt)
 
-### 11.1 Interactive Scala Shell
+The sbt project lives in `scala/tp3/`. Spark and the MySQL driver are marked
+`provided` in `build.sbt` because they're already in `$SPARK_HOME/jars`
+inside the containers, so they are **not** bundled into your JAR.
 
-Inside `spark-client`:
+### 13.1 Connection settings (differences from the TP handout)
+
+The handout assumes MySQL runs on your own machine. In this environment:
+
+```scala
+val url   = "jdbc:mysql://mysql:3306/classicmodels?useSSL=false&allowPublicKeyRetrieval=true"
+val table = "customers"                      // the DB is already in the URL
+
+val properties = new java.util.Properties()
+properties.put("user", "root")
+properties.put("password", "root")           // not ""
+
+Class.forName("com.mysql.cj.jdbc.Driver")    // old com.mysql.jdbc.Driver is deprecated
+
+val customersDF = sparkSession.read.jdbc(url, table, properties)
+```
+
+Do **not** hardcode `.master("local[*]")` in your `SparkSession`: let
+`spark-submit --master ...` decide.
+
+### 13.2 Part I: read from MySQL
+
+Put your sources in `scala/tp3/src/main/scala/`, then:
+
+```bash
+cd /workspace/scala/tp3
+sbt package
+spark-submit \
+  --class <YourMainObject> \
+  --master spark://spark-master:7077 \
+  target/scala-2.12/tp3-spark-mysql_2.12-0.1.0.jar
+```
+
+The first `sbt package` downloads dependencies (a few minutes); they are
+cached in named Docker volumes afterwards.
+
+### 13.3 Part II: write a CSV into MySQL
+
+```scala
+val empDF = sparkSession.read
+  .option("header", "true")
+  .option("inferSchema", "true")
+  .csv("/opt/spark-data/empData.csv")
+
+empDF.write
+  .mode("overwrite")                       // or "append"
+  .jdbc("jdbc:mysql://mysql:3306/ENSA_DB?useSSL=false&allowPublicKeyRetrieval=true",
+        "employees", properties)
+```
+
+Verify from the host:
+
+```bash
+docker compose exec mysql mysql -uroot -proot -e "SELECT * FROM ENSA_DB.employees LIMIT 10;"
+```
+
+### 13.4 Quick iteration without sbt
+
+For experiments, `spark-shell` works with no packaging at all (the driver is
+already on its classpath):
 
 ```bash
 spark-shell --master spark://spark-master:7077
 ```
 
-Just like `pyspark`, this drops you into a Scala REPL with `spark:
-SparkSession` already created, connected to the real cluster. Try:
+---
 
-```scala
-spark.range(1000).count()
-```
-
-Exit with `:quit`.
-
-### 11.2 Compile the Scala Application
-
-Unlike a `.py` file, a `.scala` file cannot be handed to `spark-submit`
-directly — it must be compiled into `.class` files and packaged into a JAR
-first:
-
-```text
-Scala source (TestSpark.scala)
-    ↓  scalac
-.class files
-    ↓  jar
-TestSpark.jar
-    ↓  spark-submit
-Spark cluster
-```
-
-Inside `spark-client`:
+## 14. PySpark in a Jupyter Notebook
 
 ```bash
-cd /workspace/scala
-mkdir -p build/classes
-
-# Compile against the Spark jars already installed in the image
-scalac -classpath "$SPARK_HOME/jars/*" -d build/classes TestSpark.scala
-
-# Package the compiled classes into a JAR
-cd build/classes
-jar cf ../TestSpark.jar .
-cd ../..
+docker compose exec spark-client bash
+jupyter lab --ip=0.0.0.0 --port=8888 --no-browser --allow-root
 ```
 
-You now have `/workspace/scala/build/TestSpark.jar`.
+Open the printed URL (with its token) in your host browser. Start each
+notebook with:
 
-### 11.3 Submit the Scala Application
+```python
+from pyspark.sql import SparkSession
 
-```bash
-spark-submit \
-  --class TestSpark \
-  --master spark://spark-master:7077 \
-  /workspace/scala/build/TestSpark.jar
+spark = (
+    SparkSession.builder
+    .appName("MyNotebookApp")
+    .master("spark://spark-master:7077")
+    .getOrCreate()
+)
 ```
 
-- `--class TestSpark` tells Spark which JVM class contains the entry point
-  (our file declares `object TestSpark extends App`, so the class name is
-  simply `TestSpark`, with no package prefix).
-- Driver/executor split is identical to the PySpark case: the driver runs on
-  `spark-client`, executors run on `spark-worker`.
+Reading MySQL from PySpark works the same way (driver already installed):
 
-### Understanding the Scala Test
+```python
+df = (spark.read.format("jdbc")
+      .option("url", "jdbc:mysql://mysql:3306/classicmodels?useSSL=false&allowPublicKeyRetrieval=true")
+      .option("dbtable", "customers")
+      .option("user", "root").option("password", "root")
+      .option("driver", "com.mysql.cj.jdbc.Driver")
+      .load())
+```
 
-`scala/TestSpark.scala` mirrors the PySpark test step for step: create
-`SparkSession` → print version → build a DataFrame → `show()` → `filter` →
-`select` → `groupBy().count()` (transformations) → `.count()` (the action
-that triggers execution) → `spark.stop()`.
+Call `spark.stop()` when you're done, or the executors keep holding the
+worker's 2 cores / 2 GB.
 
 ---
 
-## 12. The `data/` Directory
+## 15. The `data/` Directory
 
-Mounted into all three containers at `/opt/spark-data`. Use it for any file
-your scripts need to read or write, e.g.:
+Mounted at `/opt/spark-data` in all Spark containers:
 
 ```python
 df = spark.read.csv("/opt/spark-data/mydata.csv", header=True)
 ```
 
-Files placed here from the host (`spark-docker/data/`) are visible to
-`spark-master`, `spark-worker` and `spark-client` alike.
+---
+
+## 16. Adding Your Own Projects
+
+- **PySpark**: drop `.py` files into `python/`; live at `/workspace/python/`.
+- **Scala (single file)**: `scala/`, compile with `scalac` (section 12.3).
+- **Scala (sbt project)**: create a new folder next to `scala/tp3/` with its
+  own `build.sbt`, or add files to `scala/tp3/src/main/scala/`.
+- Rebuild the image (`docker compose build`) only if you change the
+  `Dockerfile`.
 
 ---
 
-## 13. Adding Your Own Projects
-
-- **PySpark**: drop new `.py` files into `python/` — they're live inside
-  `spark-client` at `/workspace/python/` immediately, no rebuild needed.
-- **Scala**: drop new `.scala` files into `scala/`, compile them the same
-  way as `TestSpark.scala` (section 11.2), then `spark-submit` the resulting
-  JAR.
-- Because the whole project directory is bind-mounted into `spark-client`
-  (`.:/workspace`), you only need to rebuild the image
-  (`docker compose build`) if you change the `Dockerfile` itself (e.g. to
-  add a new Python or Java library).
-
----
-
-## 14. Stopping the Environment
+## 17. Stopping the Environment
 
 ```bash
-docker compose down
+docker compose down        # stops containers, KEEPS MySQL data and sbt caches
+docker compose down -v     # also DELETES MySQL data and sbt caches
 ```
 
-Add `-v` if you ever add named volumes and want to wipe them too (this
-setup uses only bind mounts, so `-v` isn't required here).
+Warning: `-v` wipes the `mysql-data` volume, including tables you created in
+`ENSA_DB`. On the next `up`, the `mysql-init/` scripts run again from scratch.
 
 ---
 
-## 15. Troubleshooting
+## 18. Troubleshooting
 
+- **`Communications link failure` / `Connection refused` to MySQL**: you
+  probably used `localhost` in the JDBC URL. Use `mysql:3306` inside the
+  containers.
+- **`No suitable driver` / `ClassNotFoundException: com.mysql...`**: rebuild
+  the image (`docker compose build && docker compose up -d --force-recreate`);
+  the driver is added in the Dockerfile. Use `com.mysql.cj.jdbc.Driver`.
+- **`Public Key Retrieval is not allowed` / SSL errors**: add
+  `?useSSL=false&allowPublicKeyRetrieval=true` to the JDBC URL.
+- **`Unknown database 'classicmodels'`**: the SQL script was missing the first
+  time MySQL started. Check that `mysql-init/01-classicmodels.sql` exists,
+  then `docker compose down -v && docker compose up -d`.
+- **`spark-client` doesn't start**: it waits for MySQL to be `healthy`. Check
+  `docker compose logs mysql` (large imports take a moment, SQL errors show here).
+- **`Path does not exist: /opt/spark-data/empData.csv`**: check the file is in
+  `data/` on the host, and that the worker has the `./data:/opt/spark-data`
+  mount (`docker compose exec spark-worker ls /opt/spark-data`).
+- **Executors die / job hangs with `Container killed`**: not enough memory;
+  lower the memory in your job or raise the worker's `mem_limit`.
+- **sbt: `unresolved dependency`**: check internet access; versions in
+  `build.sbt` must be Scala 2.12 (`%%` picks `_2.12` automatically).
 - **Worker not showing on the Master UI**: check
-  `docker compose logs spark-worker` for connection errors, and make sure
-  `spark-master` was up before the worker tried to register
-  (`depends_on` handles ordering, but not full readiness).
+  `docker compose logs spark-worker` for connection errors.
 - **`spark-submit` hangs with no executors**: confirm the worker is `ALIVE`
-  on http://localhost:8080 and that its free cores/memory are enough for
-  your job's requested resources.
-- **Port already in use on the host**: another process is using 8080/8081/7077/4040 —
-  either stop it or change the left-hand side of the port mappings in
-  `docker-compose.yml` (e.g. `"18080:8080"`).
-- **Rebuilt Dockerfile but containers still use the old image**: run
+  on http://localhost:8080 and has enough free cores/memory.
+- **Port already in use on the host**: change the left side of the port
+  mapping in `docker-compose.yml` (e.g. `"18080:8080"`). MySQL is already on
+  `3307` to avoid a local MySQL on `3306`.
+- **Rebuilt Dockerfile but containers still use the old image**:
   `docker compose build` then `docker compose up -d --force-recreate`.
+- **`docker compose build` fails with a DNS/lookup error**: your host's DNS
+  resolver. Try `sudo systemctl restart systemd-resolved`, or add
+  `{"dns": ["8.8.8.8", "1.1.1.1"]}` to `/etc/docker/daemon.json` and run
+  `sudo systemctl restart docker`.
 
 ---
 
-## 16. Quick Command Reference
+## 19. Quick Command Reference
 
 ```bash
-# Build the shared image
+# Build / start / stop
 docker compose build
-
-# Start the cluster
 docker compose up -d
+docker compose down            # keeps MySQL data
+docker compose down -v         # wipes MySQL data + caches
 
 # Enter the dev container
 docker compose exec spark-client bash
+
+# MySQL shell
+docker compose exec mysql mysql -uroot -proot
+docker compose exec mysql mysql -uroot -proot -e "SHOW DATABASES;"
 
 # Interactive shells (inside spark-client)
 pyspark      --master spark://spark-master:7077
 spark-shell  --master spark://spark-master:7077
 
-# Submit PySpark job
+# PySpark job
 spark-submit --master spark://spark-master:7077 /workspace/python/test_spark.py
 
-# Compile + submit Scala job
-cd /workspace/scala && mkdir -p build/classes
-scalac -classpath "$SPARK_HOME/jars/*" -d build/classes TestSpark.scala
-cd build/classes && jar cf ../TestSpark.jar . && cd ../..
-spark-submit --class TestSpark --master spark://spark-master:7077 /workspace/scala/build/TestSpark.jar
+# TP3: build + submit the sbt project
+cd /workspace/scala/tp3 && sbt package
+spark-submit --class <YourMainObject> --master spark://spark-master:7077 \
+  target/scala-2.12/tp3-spark-mysql_2.12-0.1.0.jar
+
+# JupyterLab
+jupyter lab --ip=0.0.0.0 --port=8888 --no-browser --allow-root
 
 # Verify tool versions (inside spark-client)
-java -version
-scala -version
-python --version
+java -version && scala -version && sbt --version && python --version
 spark-shell --version
-pyspark --version
-
-# Stop everything
-docker compose down
 ```

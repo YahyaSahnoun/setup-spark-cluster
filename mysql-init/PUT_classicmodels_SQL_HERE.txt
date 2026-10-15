@@ -1,0 +1,2 @@
+Save the classicmodels script in this folder as: 01-classicmodels.sql
+(MySQL runs *.sql files here in alphabetical order on first start only.)
